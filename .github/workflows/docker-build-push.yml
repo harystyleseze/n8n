@@ -46,6 +46,11 @@ on:
         required: false
         type: boolean
         default: true
+      n8n_version:
+        description: 'N8N version to build'
+        required: true
+        type: string
+        default: '1.101.1'
       success_url:
         description: 'URL to call after the build is successful'
         required: false
@@ -128,7 +133,7 @@ jobs:
               echo "push_enabled=${{ inputs.push_to_registry }}" >> $GITHUB_OUTPUT
             else
               echo "release_type=${{ inputs.release_type }}" >> $GITHUB_OUTPUT
-              echo "n8n_version=snapshot" >> $GITHUB_OUTPUT
+              echo "n8n_version=${{ inputs.n8n_version }}" >> $GITHUB_OUTPUT
               echo "push_enabled=true" >> $GITHUB_OUTPUT
             fi
           elif [[ "${{ github.event_name }}" == "push" ]]; then
