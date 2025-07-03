@@ -73,18 +73,19 @@ export async function setupPostgres({
 export async function setupNginxLoadBalancer({
 	nginxImage,
 	projectName,
-	mainInstances,
+	mainCount,
 	network,
 }: {
 	nginxImage: string;
 	projectName: string;
-	mainInstances: StartedTestContainer[];
+	mainCount: number;
 	network: StartedNetwork;
 }): Promise<StartedTestContainer> {
 	// Generate upstream server entries from the list of main instances.
-	const upstreamServers = mainInstances
-		.map((_, index) => `  server ${projectName}-n8n-main-${index + 1}:5678;`)
-		.join('\n');
+	const upstreamServers = Array.from(
+		{ length: mainCount },
+		(_, index) => `  server ${projectName}-n8n-main-${index + 1}:5678;`,
+	).join('\n');
 
 	// Build the NGINX configuration with dynamic upstream servers.
 	// This allows us to have the port allocation be dynamic.

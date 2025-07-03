@@ -9,10 +9,13 @@
  * Key features for parallel execution:
  * - Dynamic port allocation to avoid conflicts (handled by testcontainers)
  * - WebSocket support through nginx load balancer
+ * - Proper WEBHOOK_URL configuration for both single and multi-main setups
  */
 
 import type { StartedNetwork, StartedTestContainer } from 'testcontainers';
 import { GenericContainer, Network, Wait } from 'testcontainers';
+import { Readable } from 'stream';
+import { createServer } from 'net';
 
 import {
 	setupNginxLoadBalancer,
@@ -38,10 +41,8 @@ const BASE_ENV: Record<string, string> = {
 	E2E_TESTS: 'true',
 	QUEUE_HEALTH_CHECK_ACTIVE: 'true',
 	N8N_DIAGNOSTICS_ENABLED: 'false',
+	N8N_RUNNERS_ENABLED: 'true',
 	NODE_ENV: 'development', // If this is set to test, the n8n container will not start, insights module is not found??
-};
-
-const MULTI_MAIN_LICENSE = {
 	N8N_LICENSE_TENANT_ID: '1001',
 	N8N_LICENSE_ACTIVATION_KEY: process.env.N8N_LICENSE_ACTIVATION_KEY ?? '',
 };
@@ -72,6 +73,22 @@ export interface N8NStack {
 	containers: StartedTestContainer[];
 }
 
+// --- Helper Functions ---
+
+/**
+ * Get an available port on the host system
+ */
+async function getAvailablePort(): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const server = createServer();
+		server.listen(0, () => {
+			const port = (server.address() as any).port;
+			server.close(() => resolve(port));
+		});
+		server.on('error', reject);
+	});
+}
+
 /**
  * Create an n8n container stack
  *
@@ -98,7 +115,7 @@ export async function createN8NStack(config: N8NConfig = {}): Promise<N8NStack> 
 	const { postgres = false, queueMode = false, env = {}, projectName } = config;
 	const queueConfig = normalizeQueueConfig(queueMode);
 	const usePostgres = postgres || !!queueConfig;
-	const uniqueProjectName = projectName ?? `n8n-${Math.random().toString(36).substring(7)}`;
+	const uniqueProjectName = projectName ?? `n8n-stack-${Math.random().toString(36).substring(7)}`;
 	const containers: StartedTestContainer[] = [];
 	let network: StartedNetwork | undefined;
 	let nginxContainer: StartedTestContainer | undefined;
@@ -141,6 +158,7 @@ export async function createN8NStack(config: N8NConfig = {}): Promise<N8NStack> 
 			EXECUTIONS_MODE: 'queue',
 			QUEUE_BULL_REDIS_HOST: 'redis',
 			QUEUE_BULL_REDIS_PORT: '6379',
+			OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: 'true',
 		};
 
 		if (queueConfig.mains > 1) {
@@ -151,33 +169,50 @@ export async function createN8NStack(config: N8NConfig = {}): Promise<N8NStack> 
 				...environment,
 				N8N_PROXY_HOPS: '1',
 				N8N_MULTI_MAIN_SETUP_ENABLED: 'true',
-				...MULTI_MAIN_LICENSE,
 			};
 		}
 	}
 
 	let baseUrl: string;
+	let allocatedPort: number | undefined;
 
-	const instances = await createN8NInstances({
-		mainCount: queueConfig?.mains ?? 1,
-		workerCount: queueConfig?.workers ?? 0,
-		uniqueProjectName: uniqueProjectName,
-		environment,
-		network,
-	});
-	containers.push(...instances);
+	try {
+		// Handle port allocation and WEBHOOK_URL configuration
+		if (queueConfig && queueConfig.mains > 1) {
+			// Multi-main setup: Create nginx first to get its port
+			nginxContainer = await setupNginxLoadBalancer({
+				nginxImage: NGINX_IMAGE,
+				projectName: uniqueProjectName,
+				mainCount: queueConfig.mains,
+				network: network!,
+			});
+			containers.push(nginxContainer);
 
-	if (queueConfig && queueConfig.mains > 1) {
-		nginxContainer = await setupNginxLoadBalancer({
-			nginxImage: NGINX_IMAGE,
-			projectName: uniqueProjectName,
-			mainInstances: instances.slice(0, queueConfig.mains),
-			network: network!,
+			// Use nginx port for webhook URL
+			const nginxPort = nginxContainer.getMappedPort(80);
+			baseUrl = `http://localhost:${nginxPort}`;
+			environment.WEBHOOK_URL = baseUrl;
+		} else {
+			// Single instance: Get an available port first
+			allocatedPort = await getAvailablePort();
+			baseUrl = `http://localhost:${allocatedPort}`;
+			environment.WEBHOOK_URL = baseUrl;
+		}
+
+		// Create n8n instances with the correct WEBHOOK_URL already set
+		const instances = await createN8NInstances({
+			mainCount: queueConfig?.mains ?? 1,
+			workerCount: queueConfig?.workers ?? 0,
+			uniqueProjectName: uniqueProjectName,
+			environment,
+			network,
+			fixedPort: allocatedPort, // Pass the allocated port for single instances
 		});
-		containers.push(nginxContainer);
-		baseUrl = `http://localhost:${nginxContainer.getMappedPort(80)}`;
-	} else {
-		baseUrl = `http://localhost:${instances[0].getMappedPort(5678)}`;
+		containers.push(...instances);
+	} catch (error) {
+		console.error('Error creating n8n instances:', error);
+		await stopN8NStack(containers, network, uniqueProjectName);
+		throw error;
 	}
 
 	return {
@@ -244,6 +279,7 @@ interface CreateInstancesOptions {
 	uniqueProjectName: string;
 	environment: Record<string, string>;
 	network?: StartedNetwork;
+	fixedPort?: number;
 }
 
 async function createN8NInstances({
@@ -252,6 +288,7 @@ async function createN8NInstances({
 	uniqueProjectName,
 	environment,
 	network,
+	fixedPort,
 }: CreateInstancesOptions): Promise<StartedTestContainer[]> {
 	const instances: StartedTestContainer[] = [];
 
@@ -265,6 +302,8 @@ async function createN8NInstances({
 			isWorker: false,
 			instanceNumber: i,
 			networkAlias: mainCount > 1 ? name : undefined,
+			// Only use fixed port for single instance
+			fixedPort: mainCount === 1 ? fixedPort : undefined,
 		});
 		instances.push(container);
 	}
@@ -293,6 +332,7 @@ interface CreateContainerOptions {
 	isWorker: boolean;
 	instanceNumber: number;
 	networkAlias?: string;
+	fixedPort?: number;
 }
 
 async function createN8NContainer({
@@ -303,7 +343,17 @@ async function createN8NContainer({
 	isWorker,
 	instanceNumber,
 	networkAlias,
+	fixedPort,
 }: CreateContainerOptions): Promise<StartedTestContainer> {
+	const logs: string[] = [];
+
+	// Collect logs and display them on failure
+	const silentLogConsumer = (stream: Readable) => {
+		stream.on('data', (chunk) => {
+			logs.push(chunk.toString().trim());
+		});
+	};
+
 	let container = new GenericContainer(N8N_IMAGE);
 
 	container = container
@@ -314,12 +364,22 @@ async function createN8NContainer({
 			instance: instanceNumber.toString(),
 		})
 		.withName(name)
+		.withLogConsumer(silentLogConsumer)
 		.withReuse();
 
 	if (isWorker) {
 		container = container.withCommand(['worker']);
 	} else {
-		container = container.withExposedPorts(5678).withWaitStrategy(N8N_WAIT_STRATEGY);
+		// For main instances, handle port exposure
+		if (fixedPort) {
+			// Single instance with fixed port
+			container = container
+				.withExposedPorts({ container: 5678, host: fixedPort })
+				.withWaitStrategy(N8N_WAIT_STRATEGY);
+		} else {
+			// Multi-main instances or dynamic port allocation
+			container = container.withExposedPorts(5678).withWaitStrategy(N8N_WAIT_STRATEGY);
+		}
 	}
 
 	if (network) {
@@ -331,10 +391,19 @@ async function createN8NContainer({
 
 	try {
 		return await container.start();
-	} catch (error) {
+	} catch (error: any) {
 		if (error instanceof Error && 'statusCode' in error && error.statusCode === 404) {
 			throw new DockerImageNotFoundError(name, error);
 		}
+		console.error(`Container "${name}" failed to start!`);
+		console.error('Original error:', error.message);
+
+		if (logs.length > 0) {
+			console.error('\n--- Container Logs ---');
+			console.error(logs.join('\n'));
+			console.error('---------------------\n');
+		}
+
 		throw error;
 	}
 }
