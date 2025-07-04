@@ -1,5 +1,6 @@
 import { PostgreSqlContainer } from '@testcontainers/postgresql';
 import { RedisContainer } from '@testcontainers/redis';
+import { Readable } from 'stream';
 import type { StartedNetwork, StartedTestContainer } from 'testcontainers';
 import { GenericContainer, Wait } from 'testcontainers';
 
@@ -75,11 +76,13 @@ export async function setupNginxLoadBalancer({
 	projectName,
 	mainCount,
 	network,
+	port,
 }: {
 	nginxImage: string;
 	projectName: string;
 	mainCount: number;
 	network: StartedNetwork;
+	port: number;
 }): Promise<StartedTestContainer> {
 	// Generate upstream server entries from the list of main instances.
 	const upstreamServers = Array.from(
@@ -91,18 +94,34 @@ export async function setupNginxLoadBalancer({
 	// This allows us to have the port allocation be dynamic.
 	const nginxConfig = buildNginxConfig(upstreamServers);
 
-	return await new GenericContainer(nginxImage)
-		.withNetwork(network)
-		.withExposedPorts(80)
-		.withCopyContentToContainer([{ content: nginxConfig, target: '/etc/nginx/nginx.conf' }])
-		.withWaitStrategy(Wait.forListeningPorts())
-		.withLabels({
-			'com.docker.compose.project': projectName,
-			'com.docker.compose.service': 'nginx-lb',
-		})
-		.withName(`${projectName}-nginx-lb`)
-		.withReuse()
-		.start();
+	const logs: string[] = [];
+	// Collect logs and display them on failure
+	const silentLogConsumer = (stream: Readable) => {
+		stream.on('data', (chunk) => {
+			logs.push(chunk.toString().trim());
+		});
+	};
+
+	try {
+		return await new GenericContainer(nginxImage)
+			.withNetwork(network)
+			.withExposedPorts({ container: 80, host: port })
+			.withCopyContentToContainer([{ content: nginxConfig, target: '/etc/nginx/nginx.conf' }])
+			.withWaitStrategy(Wait.forListeningPorts())
+			.withLabels({
+				'com.docker.compose.project': projectName,
+				'com.docker.compose.service': 'nginx-lb',
+			})
+			.withName(`${projectName}-nginx-lb`)
+			.withReuse()
+			.withLogConsumer(silentLogConsumer)
+			.start();
+	} catch (error) {
+		console.error('--- Container Logs for NGINX (from testLogConsumer on failure) ---');
+		console.error(logs.join('\n'));
+		console.error('--------------------------------------------------------');
+		throw error;
+	}
 }
 
 /**
@@ -183,6 +202,99 @@ function buildNginxConfig(upstreamServers: string): string {
       }
     }
   }`;
+}
+
+/**
+ * Builds Caddy configuration for load balancing n8n instances
+ * @param upstreamServers Array of upstream server addresses
+ * @returns The complete Caddyfile configuration as a string
+ */
+function buildCaddyConfig(upstreamServers: string[]): string {
+	// Join servers with space for Caddy's format
+	const backends = upstreamServers.join(' ');
+
+	return `
+:80 {
+  # Reverse proxy with load balancing
+  reverse_proxy ${backends} {
+    # Enable sticky sessions using cookie
+    lb_policy cookie
+
+    # Health check (optional)
+    health_uri /healthz
+    health_interval 10s
+
+    # Timeouts
+    transport http {
+      dial_timeout 60s
+      read_timeout 60s
+      write_timeout 60s
+    }
+  }
+
+  # Set max request body size
+  request_body {
+    max_size 50MB
+  }
+}`;
+}
+
+/**
+ * Setup Caddy for multi-main instances
+ * @param caddyImage The Docker image for Caddy
+ * @param projectName Project name for container naming
+ * @param mainCount Number of main instances
+ * @param network The shared Docker network
+ * @param port The host port to expose
+ * @returns A promise that resolves to the started Caddy container
+ */
+export async function setupCaddyLoadBalancer({
+	caddyImage = 'caddy:2-alpine',
+	projectName,
+	mainCount,
+	network,
+}: {
+	caddyImage?: string;
+	projectName: string;
+	mainCount: number;
+	network: StartedNetwork;
+}): Promise<StartedTestContainer> {
+	// Generate upstream server addresses
+	const upstreamServers = Array.from(
+		{ length: mainCount },
+		(_, index) => `${projectName}-n8n-main-${index + 1}:5678`,
+	);
+
+	// Build the Caddy configuration
+	const caddyConfig = buildCaddyConfig(upstreamServers);
+
+	const logs: string[] = [];
+	const silentLogConsumer = (stream: Readable) => {
+		stream.on('data', (chunk) => {
+			logs.push(chunk.toString().trim());
+		});
+	};
+
+	try {
+		return await new GenericContainer(caddyImage)
+			.withNetwork(network)
+			.withExposedPorts(80)
+			.withCopyContentToContainer([{ content: caddyConfig, target: '/etc/caddy/Caddyfile' }])
+			.withWaitStrategy(Wait.forListeningPorts())
+			.withLabels({
+				'com.docker.compose.project': projectName,
+				'com.docker.compose.service': 'caddy-lb',
+			})
+			.withName(`${projectName}-caddy-lb`)
+			.withReuse()
+			.withLogConsumer(silentLogConsumer)
+			.start();
+	} catch (error) {
+		console.error('--- Container Logs for Caddy (from testLogConsumer on failure) ---');
+		console.error(logs.join('\n'));
+		console.error('--------------------------------------------------------');
+		throw error;
+	}
 }
 
 // TODO: Look at Ollama container?

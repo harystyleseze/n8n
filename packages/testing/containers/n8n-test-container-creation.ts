@@ -20,6 +20,7 @@ import {
 	setupNginxLoadBalancer,
 	setupPostgres,
 	setupRedis,
+	setupCaddyLoadBalancer,
 } from './n8n-test-container-dependencies';
 import { DockerImageNotFoundError } from './docker-image-not-found-error';
 import { createServer } from 'net';
@@ -29,6 +30,7 @@ import { createServer } from 'net';
 const POSTGRES_IMAGE = 'postgres:16-alpine';
 const REDIS_IMAGE = 'redis:7-alpine';
 const NGINX_IMAGE = 'nginx:stable';
+const CADDY_IMAGE = 'caddy:2-alpine';
 const N8N_E2E_IMAGE = 'n8nio/n8n:local';
 
 // Default n8n image (can be overridden via N8N_DOCKER_IMAGE env var)
@@ -102,7 +104,7 @@ export async function createN8NStack(config: N8NConfig = {}): Promise<N8NStack> 
 	const uniqueProjectName = projectName ?? `n8n-stack-${Math.random().toString(36).substring(7)}`;
 	const containers: StartedTestContainer[] = [];
 	let network: StartedNetwork | undefined;
-	let nginxContainer: StartedTestContainer | undefined;
+	let loadBalancerContainer: StartedTestContainer | undefined;
 
 	let environment: Record<string, string> = { ...BASE_ENV, ...env };
 
@@ -158,28 +160,46 @@ export async function createN8NStack(config: N8NConfig = {}): Promise<N8NStack> 
 	}
 
 	let baseUrl: string;
+	let webhookUrl: string;
+	let assignedPort: number | undefined;
 
+	// Determine the webhook URL based on setup type
+	if (queueConfig && queueConfig.mains > 1) {
+		// Multi-main setup: Start load balancer first
+		loadBalancerContainer = await setupCaddyLoadBalancer({
+			caddyImage: CADDY_IMAGE,
+			projectName: uniqueProjectName,
+			mainCount: queueConfig.mains,
+			network: network!,
+		});
+		containers.push(loadBalancerContainer);
+
+		const loadBalancerPort = loadBalancerContainer.getMappedPort(80);
+		baseUrl = `http://localhost:${loadBalancerPort}`;
+		webhookUrl = baseUrl;
+	} else {
+		// Single instance: Get a port and use it for both exposure and webhook URL
+		assignedPort = await getAvailablePort();
+		baseUrl = `http://localhost:${assignedPort}`;
+		webhookUrl = baseUrl;
+	}
+
+	// Add WEBHOOK_URL to environment
+	environment = {
+		...environment,
+		WEBHOOK_URL: webhookUrl,
+	};
+
+	// Create n8n instances with the configured webhook URL
 	const instances = await createN8NInstances({
 		mainCount: queueConfig?.mains ?? 1,
 		workerCount: queueConfig?.workers ?? 0,
 		uniqueProjectName: uniqueProjectName,
 		environment,
 		network,
+		assignedPort, // Pass the assigned port for single instances
 	});
 	containers.push(...instances);
-
-	if (queueConfig && queueConfig.mains > 1) {
-		nginxContainer = await setupNginxLoadBalancer({
-			nginxImage: NGINX_IMAGE,
-			projectName: uniqueProjectName,
-			mainCount: queueConfig.mains,
-			network: network!,
-		});
-		containers.push(nginxContainer);
-		baseUrl = `http://localhost:${nginxContainer.getMappedPort(80)}`;
-	} else {
-		baseUrl = `http://localhost:${instances[0].getMappedPort(5678)}`;
-	}
 
 	return {
 		baseUrl,
@@ -245,6 +265,7 @@ interface CreateInstancesOptions {
 	uniqueProjectName: string;
 	environment: Record<string, string>;
 	network?: StartedNetwork;
+	assignedPort?: number;
 }
 
 async function createN8NInstances({
@@ -253,6 +274,7 @@ async function createN8NInstances({
 	uniqueProjectName,
 	environment,
 	network,
+	assignedPort,
 }: CreateInstancesOptions): Promise<StartedTestContainer[]> {
 	const instances: StartedTestContainer[] = [];
 
@@ -266,7 +288,7 @@ async function createN8NInstances({
 			isWorker: false,
 			instanceNumber: i,
 			networkAlias: mainCount > 1 ? name : undefined,
-			port: mainCount === 1 ? await getAvailablePort() : undefined,
+			port: mainCount === 1 ? assignedPort : undefined, // Use assigned port for single instances
 		});
 		instances.push(container);
 	}
